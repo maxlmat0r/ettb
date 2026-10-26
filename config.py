@@ -53,8 +53,23 @@ EMAIL = _required("EMAIL")
 PASSWORD = _required("PASSWORD")
 
 # --- Какие письма обрабатывать
-# Адреса отправителей писем с кодами, через запятую
-ALLOWED_SENDERS = frozenset(_list("ALLOWED_SENDERS"))
+# Адреса отправителей писем с кодами, через запятую.
+# У каждого адреса может быть свой префикс: адрес=Префикс.
+# Пример: support@kino.watch=Kinopub,noreply@bank.ru=Банк
+def _parse_senders(name):
+    senders, prefixes = set(), {}
+    for item in _list(name, lower=False):
+        address, has_prefix, prefix = item.partition("=")
+        address = address.strip().lower()
+        if not address:
+            raise SystemExit(f"В {name} пустой адрес в элементе {item!r}")
+        senders.add(address)
+        if has_prefix:
+            prefixes[address] = prefix.strip()
+    return frozenset(senders), prefixes
+
+
+ALLOWED_SENDERS, SENDER_PREFIXES = _parse_senders("ALLOWED_SENDERS")
 if not ALLOWED_SENDERS:
     raise SystemExit("Не задана переменная окружения ALLOWED_SENDERS. См. .env.example")
 # Необязательно: адреса получателей (например, алиасы ящика), через запятую.
@@ -68,8 +83,14 @@ CODE_KEYWORDS = _list("CODE_KEYWORDS", "код,code,пароль,password,otp")
 # --- Telegram
 TELEGRAM_BOT_TOKEN = _required("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = _required("TELEGRAM_CHAT_ID")
-# Текст перед кодом в сообщении, например название сервиса. Пусто — только код.
+# Префикс по умолчанию для отправителей, у которых в ALLOWED_SENDERS
+# не указан свой. Пусто — только код.
 MESSAGE_PREFIX = os.getenv("MESSAGE_PREFIX", "").strip()
+
+
+def prefix_for(sender):
+    """Префикс сообщения для отправителя: свой или по умолчанию."""
+    return SENDER_PREFIXES.get(sender, MESSAGE_PREFIX)
 
 # --- Интервалы и таймауты
 POLL_INTERVAL = _int("POLL_INTERVAL", 10)

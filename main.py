@@ -56,14 +56,14 @@ def _mask(code):
 _http = requests.Session()  # переиспользует TCP/TLS-соединение с Telegram
 
 
-def send_to_telegram(code, attempts=3):
+def send_to_telegram(code, prefix="", attempts=3):
     """Отправляет код в Telegram. Возвращает True при успехе.
 
     Повторы короткие: если Telegram недоступен, письмо останется
     непрочитанным и будет отправлено в следующем цикле проверки.
     """
     url = f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}/sendMessage"
-    prefix = f"{html.escape(config.MESSAGE_PREFIX)}: " if config.MESSAGE_PREFIX else ""
+    prefix = f"{html.escape(prefix)}: " if prefix else ""
     payload = {
         "chat_id": config.TELEGRAM_CHAT_ID,
         # <code> позволяет скопировать код одним нажатием
@@ -340,7 +340,7 @@ class Processor:
         log.info("Найден код %s в письме %s, письмо отправлено %s назад",
                  _mask(code), uid, age_text)
         started = time.monotonic()
-        if send_to_telegram(code):
+        if send_to_telegram(code, config.prefix_for(sender)):
             took = time.monotonic() - started
             log.info("Код отправлен в Telegram за %.1f с", took)
             if took > 5:
@@ -359,7 +359,11 @@ def _handle_sigterm(signum, frame):
 def main():
     signal.signal(signal.SIGTERM, _handle_sigterm)
     log.info("Запуск. Ящик %s, папка %s, отправители: %s",
-             config.EMAIL, config.IMAP_FOLDER, ", ".join(sorted(config.ALLOWED_SENDERS)))
+             config.EMAIL, config.IMAP_FOLDER,
+             ", ".join(
+                 f"{s} ({config.prefix_for(s) or 'без префикса'})"
+                 for s in sorted(config.ALLOWED_SENDERS)
+             ))
     if config.ALLOWED_RECIPIENTS:
         log.info("Получатели: %s", ", ".join(sorted(config.ALLOWED_RECIPIENTS)))
 
