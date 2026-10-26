@@ -53,8 +53,15 @@ def _mask(code):
 # ---------------------------------------------------------------- Telegram
 
 
+_http = requests.Session()  # переиспользует TCP/TLS-соединение с Telegram
+
+
 def send_to_telegram(code, attempts=3):
-    """Отправляет код в Telegram. Возвращает True при успехе."""
+    """Отправляет код в Telegram. Возвращает True при успехе.
+
+    Повторы короткие: если Telegram недоступен, письмо останется
+    непрочитанным и будет отправлено в следующем цикле проверки.
+    """
     url = f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}/sendMessage"
     prefix = f"{html.escape(config.MESSAGE_PREFIX)}: " if config.MESSAGE_PREFIX else ""
     payload = {
@@ -66,11 +73,14 @@ def send_to_telegram(code, attempts=3):
 
     for attempt in range(1, attempts + 1):
         try:
-            response = requests.post(url, json=payload, timeout=config.HTTP_TIMEOUT)
+            response = _http.post(
+                url, json=payload, timeout=(5, config.HTTP_TIMEOUT)
+            )
         except requests.RequestException as exc:
             log.warning("Telegram недоступен (попытка %d/%d): %s",
                         attempt, attempts, _redact(exc))
-            time.sleep(2 ** attempt)
+            if attempt < attempts:
+                time.sleep(1)
             continue
 
         if response.ok:
@@ -81,6 +91,7 @@ def send_to_telegram(code, attempts=3):
                 retry_after = int(response.json()["parameters"]["retry_after"])
             except (ValueError, KeyError, TypeError):
                 retry_after = 5
+            retry_after = min(retry_after, 15)
             log.warning("Telegram ограничил частоту, ждём %d с", retry_after)
             time.sleep(retry_after)
             continue
@@ -89,7 +100,8 @@ def send_to_telegram(code, attempts=3):
                   response.status_code, _redact(response.text[:300]))
         if 400 <= response.status_code < 500:
             return False  # ошибка в запросе или настройках, повтор не поможет
-        time.sleep(2 ** attempt)
+        if attempt < attempts:
+            time.sleep(1)
 
     return False
 
@@ -179,6 +191,10 @@ def get_email_age(msg):
 # -------------------------------------------------------------------- IMAP
 
 
+class AuthError(Exception):
+    """Сервер отклонил логин или пароль."""
+
+
 class MailClient:
     """Держит одно IMAP-соединение и переподключается при обрыве."""
 
@@ -197,7 +213,11 @@ class MailClient:
                 config.EMAIL_SERVER, config.IMAP_PORT, timeout=config.IMAP_TIMEOUT
             )
             self.conn.starttls()
-        self.conn.login(config.EMAIL, config.PASSWORD)
+        try:
+            self.conn.login(config.EMAIL, config.PASSWORD)
+        except imaplib.IMAP4.error as exc:
+            self.close()
+            raise AuthError(exc) from exc
         folder = config.IMAP_FOLDER.replace("\\", "\\\\").replace('"', '\\"')
         status, _ = self.conn.select(f'"{folder}"')
         if status != "OK":
@@ -271,6 +291,7 @@ class Processor:
         for sender in sorted(config.ALLOWED_SENDERS):
             uids.extend(self.client.search_unseen_from(sender, since))
 
+        log.debug("Проверка: непрочитанных писем от отправителей %d", len(uids))
         for uid in uids:
             if uid in self.handled:
                 continue
@@ -315,9 +336,15 @@ class Processor:
             self.handled.add(uid)
             return
 
-        log.info("Найден код %s в письме %s", _mask(code), uid)
+        age_text = f"{age.total_seconds():.0f} с" if age is not None else "неизвестно"
+        log.info("Найден код %s в письме %s, письмо отправлено %s назад",
+                 _mask(code), uid, age_text)
+        started = time.monotonic()
         if send_to_telegram(code):
-            log.info("Код отправлен в Telegram")
+            took = time.monotonic() - started
+            log.info("Код отправлен в Telegram за %.1f с", took)
+            if took > 5:
+                log.warning("Отправка в Telegram заняла %.1f с, проверьте сеть сервера", took)
             self.handled.add(uid)
             self.client.mark_seen(uid)
         else:
@@ -338,23 +365,50 @@ def main():
 
     client = MailClient()
     processor = Processor(client)
-    backoff = config.POLL_INTERVAL
+    auth_backoff = 0
+    stats = {"cycles": 0, "errors": 0, "slowest": 0.0}
+    last_report = time.monotonic()
 
     try:
         while True:
+            started = time.monotonic()
+            delay = None
             try:
                 processor.run_once()
-                backoff = config.POLL_INTERVAL
-            except imaplib.IMAP4.error as exc:
-                # Сюда попадают и ошибки входа: не долбим сервер, растим паузу
-                log.error("Ошибка IMAP: %s", exc)
-                client.close()
-                backoff = min(backoff * 2, 300)
+                auth_backoff = 0
+            except AuthError as exc:
+                # Неверный пароль или блокировка входа: частые попытки
+                # только продлят блокировку, поэтому пауза растёт до 5 минут
+                auth_backoff = min(max(auth_backoff * 2, 30), 300)
+                log.error("Сервер отклонил вход: %s. Повтор через %d с", exc, auth_backoff)
+                delay = auth_backoff
+                stats["errors"] += 1
             except Exception as exc:
-                log.error("Ошибка в работе приложения: %s", _redact(exc))
+                # Обрыв соединения, таймаут и т. п.: переподключаемся быстро,
+                # чтобы не пропустить код
+                log.error("Ошибка: %s: %s. Переподключение",
+                          type(exc).__name__, _redact(exc))
                 client.close()
-                backoff = min(backoff * 2, 300)
-            time.sleep(backoff)
+                delay = min(5, config.POLL_INTERVAL)
+                stats["errors"] += 1
+
+            elapsed = time.monotonic() - started
+            stats["cycles"] += 1
+            stats["slowest"] = max(stats["slowest"], elapsed)
+            if elapsed > config.POLL_INTERVAL:
+                log.warning("Проверка почты заняла %.1f с, дольше интервала %d с",
+                            elapsed, config.POLL_INTERVAL)
+
+            if time.monotonic() - last_report >= 900:
+                log.info("Работаю: проверок %d, ошибок %d, самая долгая %.1f с",
+                         stats["cycles"], stats["errors"], stats["slowest"])
+                stats = {"cycles": 0, "errors": 0, "slowest": 0.0}
+                last_report = time.monotonic()
+
+            if delay is None:
+                # Проверки начинаются каждые POLL_INTERVAL секунд
+                delay = max(0.0, config.POLL_INTERVAL - elapsed)
+            time.sleep(delay)
     except (KeyboardInterrupt, SystemExit):
         log.info("Остановка")
     finally:
